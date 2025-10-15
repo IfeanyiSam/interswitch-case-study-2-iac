@@ -1,0 +1,372 @@
+name: Terraform Infrastructure Pipeline
+
+on:
+  pull_request:
+    branches: [main]
+    paths: ['environments/**', 'modules/**', 'policies/**']
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  security-events: write
+
+env:
+  TF_VERSION: '1.6.0'
+
+jobs:
+  # Determine which environment to deploy based on changed files
+  determine-environment:
+    name: Determine Environment
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.check-changes.outputs.target_environment }}
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+         
+    - name: Validate Environment Changes
+      id: check-changes
+      run: |
+        chmod +x scripts/check-environment-changes.sh
+        ./scripts/check-environment-changes.sh
+
+  terraform-plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    needs: determine-environment
+    environment: ${{ needs.determine-environment.outputs.environment }}
+    
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Fetch full history for git diff
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ env.TF_VERSION }}
+    
+    - name: Import Secrets from Vault
+      id: vault-secrets
+      uses: hashicorp/vault-action@v2
+      with:
+        url: ${{ secrets.VAULT_ADDR }}
+        token: ${{ secrets.VAULT_TOKEN }}
+        secrets: |
+          secret/data/switch/${{ needs.determine-environment.outputs.environment }}/network aws_region | AWS_REGION ;
+          secret/data/switch/${{ needs.determine-environment.outputs.environment }}/network vpc_cidr | VPC_CIDR ;
+          secret/data/switch/${{ needs.determine-environment.outputs.environment }}/network public_subnets | PUBLIC_SUBNETS ;
+          secret/data/switch/${{ needs.determine-environment.outputs.environment }}/network private_subnets | PRIVATE_SUBNETS ;
+          secret/data/switch/${{ needs.determine-environment.outputs.environment }}/network enable_nat_gateway | ENABLE_NAT
+    
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ steps.vault-secrets.outputs.AWS_REGION }}
+    
+    - name: Create Terraform Variables File
+      run: |
+        ENV=${{ needs.determine-environment.outputs.environment }}
+        echo "=== Environment: $ENV ==="
+        
+        # Create tfvars file from Vault secrets
+        touch environments/temp-$ENV.tfvars
+        echo 'aws_region = "${{ steps.vault-secrets.outputs.AWS_REGION }}"' >> environments/temp-$ENV.tfvars
+        echo 'vpc_cidr = "${{ steps.vault-secrets.outputs.VPC_CIDR }}"' >> environments/temp-$ENV.tfvars
+        echo 'public_subnet_cidrs = ${{ steps.vault-secrets.outputs.PUBLIC_SUBNETS }}' >> environments/temp-$ENV.tfvars
+        echo 'private_subnet_cidrs = ${{ steps.vault-secrets.outputs.PRIVATE_SUBNETS }}' >> environments/temp-$ENV.tfvars
+        echo 'enable_nat_gateway = ${{ steps.vault-secrets.outputs.ENABLE_NAT }}' >> environments/temp-$ENV.tfvars
+    
+    - name: Terraform Init
+      working-directory: environments/${{ needs.determine-environment.outputs.environment }}
+      run: terraform init
+    
+    - name: Terraform Validate
+      working-directory: environments/${{ needs.determine-environment.outputs.environment }}
+      run: terraform validate
+    
+    - name: Setup OPA
+      uses: open-policy-agent/setup-opa@v2
+      with:
+        version: latest
+    
+    - name: Run OPA Tests
+      run: |
+        if [ -d "policies" ] && [ "$(ls -A policies/*.rego 2>/dev/null)" ]; then
+          echo "Running OPA tests..."
+          opa test policies/*.rego -v
+        else
+          echo "No OPA policies found, skipping..."
+        fi
+    
+    - name: Terrascan Security Scan
+      uses: tenable/terrascan-action@main
+      with:
+        iac_type: terraform
+        iac_dir: environments/${{ needs.determine-environment.outputs.environment }}
+        policy_type: aws
+        only_warn: true
+        sarif_upload: true
+    
+    - name: Upload Terrascan Results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: terrascan-results-${{ needs.determine-environment.outputs.environment }}
+        path: terrascan.sarif
+        retention-days: 30
+        if-no-files-found: ignore
+    
+    - name: Upload SARIF to GitHub Security
+      uses: github/codeql-action/upload-sarif@v3
+      if: always() && hashFiles('terrascan.sarif') != ''
+      with:
+        sarif_file: terrascan.sarif
+        category: terrascan-${{ needs.determine-environment.outputs.environment }}
+    
+    - name: Terraform Plan
+      working-directory: environments/${{ needs.determine-environment.outputs.environment }}
+      run: |
+        terraform plan -var-file="../temp-${{ needs.determine-environment.outputs.environment }}.tfvars" -out=tfplan
+        terraform show -json tfplan > plan.json
+        terraform show -no-color tfplan > plan.txt
+    
+    - name: Validate Policies
+      working-directory: environments/${{ needs.determine-environment.outputs.environment }}
+      run: |
+        echo "=== Running OPA policy check ==="
+        VIOLATIONS=$(opa eval -d ../../policies -i plan.json "data.terraform.security.deny[x]" --format raw)
+        echo "Policy check result: $VIOLATIONS"
+        if [ ! -z "$VIOLATIONS" ] && [ "$VIOLATIONS" != "undefined" ]; then
+          echo "Policy violations found: $VIOLATIONS"
+          exit 1
+        else
+          echo "No policy violations found"
+        fi
+    
+    - name: Upload Terraform Plan
+      uses: actions/upload-artifact@v4
+      with:
+        name: tfplan-${{ needs.determine-environment.outputs.environment }}
+        path: environments/${{ needs.determine-environment.outputs.environment }}/tfplan
+        retention-days: 1
+    
+    - name: Comment PR with Plan
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs');
+          const plan = fs.readFileSync('environments/${{ needs.determine-environment.outputs.environment }}/plan.txt', 'utf8');
+          const environment = '${{ needs.determine-environment.outputs.environment }}';
+          
+          const output = `## 🏗️ Terraform Plan - ${environment.charAt(0).toUpperCase() + environment.slice(1)}
+          
+          **Target Branch:** \`${{ github.base_ref }}\` → **Environment:** \`${environment}\`
+          **Author:** @${{ github.actor }}
+          
+          <details>
+          <summary> Click to view plan details</summary>
+          
+          \`\`\`hcl
+          ${plan}
+          \`\`\`
+          </details>
+          
+          ✅ **Validation Status:**
+          - Environment change validation: Passed
+          - Terrascan security scan: Completed
+          - OPA policy validation: Passed
+          - Terraform plan: Generated successfully
+          
+          ## ${environment.charAt(0).toUpperCase() + environment.slice(1)} Deployment Approval Required
+          
+          **@IfeanyiSam** - Your approval is required before this infrastructure change can be deployed.
+          
+          ⚠️ **This deployment requires explicit approval for ${environment} environment**
+          
+          *Awaiting ${environment} approval before deployment.*`;
+          
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: output
+          });
+          
+          // Request review from IfeanyiSam (if not PR author)
+          if (context.actor !== 'IfeanyiSam') {
+            try {
+              await github.rest.pulls.requestReviewers({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.issue.number,
+                reviewers: ['IfeanyiSam']
+              });
+            } catch (error) {
+              console.log('Could not request review (likely PR author is the reviewer):', error.message);
+            }
+          }
+
+  # Deploy to dev immediately (no approval needed)
+  deploy-dev:
+    name: Deploy to Dev Environment
+    runs-on: ubuntu-latest
+    needs: [determine-environment, terraform-plan]
+    if: needs.determine-environment.outputs.environment == 'dev'
+    environment: dev
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ env.TF_VERSION }}
+    
+    - name: Import Secrets from Vault
+      id: vault-secrets
+      uses: hashicorp/vault-action@v2
+      with:
+        url: ${{ secrets.VAULT_ADDR }}
+        token: ${{ secrets.VAULT_TOKEN }}
+        secrets: |
+          secret/data/switch/dev/network aws_region | AWS_REGION ;
+          secret/data/switch/dev/network vpc_cidr | VPC_CIDR ;
+          secret/data/switch/dev/network public_subnets | PUBLIC_SUBNETS ;
+          secret/data/switch/dev/network private_subnets | PRIVATE_SUBNETS ;
+          secret/data/switch/dev/network enable_nat_gateway | ENABLE_NAT
+    
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ steps.vault-secrets.outputs.AWS_REGION }}
+    
+    - name: Create Terraform Variables File
+      run: |
+        echo 'aws_region = "${{ steps.vault-secrets.outputs.AWS_REGION }}"' > environments/temp-dev.tfvars
+        echo 'vpc_cidr = "${{ steps.vault-secrets.outputs.VPC_CIDR }}"' >> environments/temp-dev.tfvars
+        echo 'public_subnet_cidrs = ${{ steps.vault-secrets.outputs.PUBLIC_SUBNETS }}' >> environments/temp-dev.tfvars
+        echo 'private_subnet_cidrs = ${{ steps.vault-secrets.outputs.PRIVATE_SUBNETS }}' >> environments/temp-dev.tfvars
+        echo 'enable_nat_gateway = ${{ steps.vault-secrets.outputs.ENABLE_NAT }}' >> environments/temp-dev.tfvars
+    
+    - name: Download Plan Artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: tfplan-dev
+        path: environments/dev
+    
+    - name: Terraform Init
+      working-directory: environments/dev
+      run: terraform init
+    
+    - name: Terraform Apply
+      working-directory: environments/dev
+      run: terraform apply -auto-approve tfplan
+    
+    - name: Merge PR
+      uses: actions/github-script@v7
+      with:
+        script: |
+          await github.rest.pulls.merge({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            pull_number: context.issue.number,
+            commit_title: `Deploy to dev - ${context.sha.substring(0, 7)}`,
+            merge_method: 'squash'
+          });
+
+  # Manual approval for staging/production
+  request-approval:
+    name: Request Approval for ${{ needs.determine-environment.outputs.environment }}
+    runs-on: ubuntu-latest
+    needs: [determine-environment, terraform-plan]
+    if: needs.determine-environment.outputs.environment == 'staging' || needs.determine-environment.outputs.environment == 'production'
+    
+    steps:
+    - name: Manual Approval
+      uses: trstringer/manual-approval@v1
+      with:
+        secret: ${{ secrets.GITHUB_TOKEN }}
+        approvers: IfeanyiSam
+        minimum-approvals: 1
+        issue-title: "Deploy Infrastructure to ${{ needs.determine-environment.outputs.environment }} Environment"
+        issue-body: "Please approve ${{ needs.determine-environment.outputs.environment }} infrastructure deployment. All validation checks have passed."
+
+  # Deploy infrastructure after approval (staging/production only)
+  terraform-apply:
+    name: Deploy Infrastructure to ${{ needs.determine-environment.outputs.environment }}
+    runs-on: ubuntu-latest
+    needs: [determine-environment, terraform-plan, request-approval]
+    environment: ${{ needs.determine-environment.outputs.environment }}
+    if: needs.determine-environment.outputs.environment == 'staging' || needs.determine-environment.outputs.environment == 'production'
+    
+    steps:
+    - uses: actions/checkout@v4
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ env.TF_VERSION }}
+    
+    - name: Import Secrets from Vault
+      id: vault-secrets
+      uses: hashicorp/vault-action@v2
+      with:
+        url: ${{ secrets.VAULT_ADDR }}
+        token: ${{ secrets.VAULT_TOKEN }}
+        secrets: |
+          secret/data/switch/${{ needs.determine-environment.outputs.environment }}/network aws_region | AWS_REGION ;
+          secret/data/switch/${{ needs.determine-environment.outputs.environment }}/network vpc_cidr | VPC_CIDR ;
+          secret/data/switch/${{ needs.determine-environment.outputs.environment }}/network public_subnets | PUBLIC_SUBNETS ;
+          secret/data/switch/${{ needs.determine-environment.outputs.environment }}/network private_subnets | PRIVATE_SUBNETS ;
+          secret/data/switch/${{ needs.determine-environment.outputs.environment }}/network enable_nat_gateway | ENABLE_NAT
+    
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ steps.vault-secrets.outputs.AWS_REGION }}
+    
+    - name: Create Terraform Variables File
+      run: |
+        ENV=${{ needs.determine-environment.outputs.environment }}
+        echo "=== Environment: $ENV ==="
+        
+        # Create tfvars file from Vault secrets
+        touch environments/temp-$ENV.tfvars
+        echo 'aws_region = "${{ steps.vault-secrets.outputs.AWS_REGION }}"' >> environments/temp-$ENV.tfvars
+        echo 'vpc_cidr = "${{ steps.vault-secrets.outputs.VPC_CIDR }}"' >> environments/temp-$ENV.tfvars
+        echo 'public_subnet_cidrs = ${{ steps.vault-secrets.outputs.PUBLIC_SUBNETS }}' >> environments/temp-$ENV.tfvars
+        echo 'private_subnet_cidrs = ${{ steps.vault-secrets.outputs.PRIVATE_SUBNETS }}' >> environments/temp-$ENV.tfvars
+        echo 'enable_nat_gateway = ${{ steps.vault-secrets.outputs.ENABLE_NAT }}' >> environments/temp-$ENV.tfvars
+    
+    - name: Download Plan Artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: tfplan-${{ needs.determine-environment.outputs.environment }}
+        path: environments/${{ needs.determine-environment.outputs.environment }}
+    
+    - name: Terraform Init
+      working-directory: environments/${{ needs.determine-environment.outputs.environment }}
+      run: terraform init
+    
+    - name: Terraform Apply
+      working-directory: environments/${{ needs.determine-environment.outputs.environment }}
+      run: terraform apply -auto-approve tfplan
+    
+    - name: Merge PR
+      uses: actions/github-script@v7
+      with:
+        script: |
+          await github.rest.pulls.merge({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            pull_number: context.issue.number,
+            commit_title: `Deploy to ${{ needs.determine-environment.outputs.environment }} - ${context.sha.substring(0, 7)}`,
+            merge_method: 'squash'
+          });
